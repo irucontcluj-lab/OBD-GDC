@@ -1,0 +1,235 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Create basic Android project structure
+      run: |
+        mkdir -p app/src/main/java/com/diagnoza/elm327
+        mkdir -p app/src/main/res/layout
+        
+        # 1. AndroidManifest.xml
+        cat << 'EOF' > app/src/main/AndroidManifest.xml
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+            package="com.diagnoza.elm327">
+            <uses-permission android:name="android.permission.BLUETOOTH" />
+            <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+            <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+            <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+            <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+            <application
+                android:allowBackup="true"
+                android:icon="@mipmap/ic_launcher"
+                android:label="Kingbolen OBD2"
+                android:roundIcon="@mipmap/ic_launcher_round"
+                android:supportsRtl="true"
+                android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+                <activity android:name=".MainActivity" android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+            </application>
+        </manifest>
+        EOF
+
+        # 2. activity_main.xml
+        cat << 'EOF' > app/src/main/res/layout/activity_main.xml
+        <?xml version="1.0" encoding="utf-8"?>
+        <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+            android:layout_width="match_parent" android:layout_height="match_parent" android:padding="16dp">
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical">
+                <TextView android:layout_width="match_parent" android:layout_height="wrap_content" text="Kingbolen ELM327 OBD2" textSize="20sp" textStyle="bold" gravity="center" android:layout_marginBottom="16dp"/>
+                <TextView android:id="@+id/tvStatus" android:layout_width="match_parent" android:layout_height="wrap_content" text="Status: Neconectat" textStyle="bold" android:textColor="#D32F2F" gravity="center" android:layout_marginBottom="12dp"/>
+                <Button android:id="@+id/btnConnect" android:layout_width="match_parent" android:layout_height="wrap_content" text="Conectează Bluetooth (Kingbolen)" android:layout_marginBottom="20dp"/>
+                <TextView android:layout_width="match_parent" android:layout_height="wrap_content" text="📊 DATE LIVE MOTOR" textStyle="bold" android:layout_marginBottom="10dp"/>
+                <TextView android:id="@+id/tvRpm" android:layout_width="match_parent" android:layout_height="wrap_content" text="Turație (RPM): ---" textSize="16sp" android:layout_marginBottom="8dp"/>
+                <TextView android:id="@+id/tvSpeed" android:layout_width="match_parent" android:layout_height="wrap_content" text="Viteză: --- km/h" textSize="16sp" android:layout_marginBottom="8dp"/>
+                <TextView android:id="@+id/tvTemp" android:layout_width="match_parent" android:layout_height="wrap_content" text="Temp. Antigel: --- °C" textSize="16sp" android:layout_marginBottom="20dp"/>
+                <Button android:id="@+id/btnReadDtc" android:layout_width="match_parent" android:layout_height="wrap_content" text="Citește Erori (DTC)" android:layout_marginBottom="10dp"/>
+                <Button android:id="@+id/btnClearDtc" android:layout_width="match_parent" android:layout_height="wrap_content" text="Șterge Erori" android:layout_marginBottom="10dp"/>
+                <TextView android:id="@+id/tvDtcResult" android:layout_width="match_parent" android:layout_height="wrap_content" text="Rezultat erori..." padding="10dp" background="#E0E0E0"/>
+            </LinearLayout>
+        </ScrollView>
+        EOF
+
+        # 3. MainActivity.kt
+        cat << 'EOF' > app/src/main/java/com/diagnoza/elm327/MainActivity.kt
+        package com.diagnoza.elm327
+        import android.Manifest
+        import android.bluetooth.BluetoothAdapter
+        import android.bluetooth.BluetoothDevice
+        import android.bluetooth.BluetoothSocket
+        import android.content.pm.PackageManager
+        import android.os.Build
+        import android.os.Bundle
+        import android.widget.Button
+        import android.widget.TextView
+        import android.widget.Toast
+        import androidx.appcompat.app.AppCompatActivity
+        import androidx.core.app.ActivityCompat
+        import java.io.InputStream
+        import java.io.OutputStream
+        import java.util.UUID
+
+        class MainActivity : AppCompatActivity() {
+            private val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+            private var socket: BluetoothSocket? = null
+            private var input: InputStream? = null
+            private var output: OutputStream? = null
+            private var connected = false
+            private var polling = false
+
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                setContentView(R.layout.activity_main)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.ACCESS_FINE_LOCATION), 1)
+                } else {
+                    ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
+                }
+                findViewById<Button>(R.id.btnConnect).setOnClickListener { connect() }
+                findViewById<Button>(R.id.btnReadDtc).setOnClickListener { readDtc() }
+                findViewById<Button>(R.id.btnClearDtc).setOnClickListener { clearDtc() }
+            }
+
+            private fun connect() {
+                val adapter = BluetoothAdapter.getDefaultAdapter()
+                if (adapter == null || !adapter.isEnabled) {
+                    Toast.makeText(this, "Activează Bluetooth-ul!", Toast.LENGTH_SHORT).show()
+                    return
+                }
+                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return
+                
+                val device = adapter.bondedDevices.firstOrNull { it.name?.contains("OBD", true) == true || it.name?.contains("Kingbolen", true) == true }
+                if (device == null) {
+                    Toast.makeText(this, "Interfața Kingbolen nu este împerecheată în telefon!", Toast.LENGTH_LONG).show()
+                    return
+                }
+                findViewById<TextView>(R.id.tvStatus).text = "Se conectează..."
+                Thread {
+                    try {
+                        socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
+                        socket?.connect()
+                        input = socket?.inputStream
+                        output = socket?.outputStream
+                        send("AT Z\r"); Thread.sleep(500)
+                        send("AT E0\r"); Thread.sleep(200)
+                        send("AT SP 0\r"); Thread.sleep(300)
+                        connected = true
+                        runOnUiThread { 
+                            findViewById<TextView>(R.id.tvStatus).text = "Status: Conectat ✅"
+                            startLive()
+                        }
+                    } catch(e: Exception) {
+                        runOnUiThread { findViewById<TextView>(R.id.tvStatus).text = "Status: Eroare conectare ❌" }
+                    }
+                }.start()
+            }
+
+            private fun send(cmd: String): String {
+                return try {
+                    output?.write(cmd.toByteArray()); output?.flush()
+                    val buf = ByteArray(1024); val sb = StringBuilder()
+                    val start = System.currentTimeMillis()
+                    while(System.currentTimeMillis() - start < 2000) {
+                        if(input!!.available() > 0) {
+                            val len = input!!.read(buf)
+                            sb.append(String(buf, 0, len))
+                            if(sb.contains(">")) break
+                        }
+                    }
+                    sb.toString().replace(">", "").trim()
+                } catch(e: Exception) { "" }
+            }
+
+            private fun startLive() {
+                polling = true
+                Thread {
+                    while(connected && polling) {
+                        val rpmRaw = send("010C\r")
+                        val speedRaw = send("010D\r")
+                        val tempRaw = send("0105\r")
+                        runOnUiThread {
+                            findViewById<TextView>(R.id.tvRpm).text = "Turație (RPM): ${parseRpm(rpmRaw)}"
+                            findViewById<TextView>(R.id.tvSpeed).text = "Viteză: ${parseSpeed(speedRaw)} km/h"
+                            findViewById<TextView>(R.id.tvTemp).text = "Temp. Antigel: ${parseTemp(tempRaw)} °C"
+                        }
+                        Thread.sleep(400)
+                    }
+                }.start()
+            }
+
+            private fun parseRpm(raw: String): String {
+                val c = raw.replace(" ", "")
+                if(c.contains("410C") && c.length >= 8) {
+                    try { val i = c.indexOf("410C"); return ((c.substring(i+4, i+6).toInt(16) * 256 + c.substring(i+6, i+8).toInt(16)) / 4).toString() } catch(e:Exception){}
+                }
+                return "---"
+            }
+            private fun parseSpeed(raw: String): String {
+                val c = raw.replace(" ", "")
+                if(c.contains("410D") && c.length >= 6) {
+                    try { val i = c.indexOf("410D"); return c.substring(i+4, i+6).toInt(16).toString() } catch(e:Exception){}
+                }
+                return "---"
+            }
+            private fun parseTemp(raw: String): String {
+                val c = raw.replace(" ", "")
+                if(c.contains("4105") && c.length >= 6) {
+                    try { val i = c.indexOf("4105"); return (c.substring(i+4, i+6).toInt(16) - 40).toString() } catch(e:Exception){}
+                }
+                return "---"
+            }
+
+            private fun readDtc() {
+                if(!connected) return
+                polling = false
+                Thread {
+                    val res = send("03\r")
+                    runOnUiThread { findViewById<TextView>(R.id.tvDtcResult).text = if(res.contains("NO DATA")) "Fără erori stocate." else res; polling = true; startLive() }
+                }.start()
+            }
+            private fun clearDtc() {
+                if(!connected) return
+                polling = false
+                Thread {
+                    val res = send("04\r")
+                    runOnUiThread { findViewById<TextView>(R.id.tvDtcResult).text = "Erori șterse. Răspuns: $res"; polling = true; startLive() }
+                }.start()
+            }
+        }
+        EOF
+
+    - name: Set up JDK 17 for Build
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Build APK with Gradle
+      run: |
+        gradle init --type basic --script-defaults
+        ./gradlew assembleDebug
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v3
+      with:
+        name: Kingbolen-OBD2-App
+        path: app/build/outputs/apk/debug/app-debug.apk
